@@ -11,7 +11,11 @@ import types
 import logging
 import yaml
 from operator import methodcaller, attrgetter
-from typing import (List, Set, Optional, Iterator, Iterable, Tuple, Union, OrderedDict)
+from typing import (List, Set, Optional, Iterator, Iterable, Tuple, Union, OrderedDict, Sequence)
+import ast
+from types import MappingProxyType
+from typing import Optional
+
 
 from . import Messages
 from .base import Element
@@ -21,6 +25,298 @@ from .utils import expr_utils
 
 log = logging.getLogger(__name__)
 
+# Optional but common in GRC expressions
+try:
+    import numpy as _np
+except Exception:
+    _np = None
+import math as _math
+
+class UnsafeExpressionError(Exception):
+    pass
+
+# Restrictive builtins: no __import__, open, exec, eval, compile, etc.
+SAFE_BUILTINS = MappingProxyType({
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "round": round,
+    "int": int,
+    "float": float,
+    "complex": complex,
+    "bool": bool,
+    "str": str,
+    "len": len,
+    "tuple": tuple,
+    "list": list,
+    "dict": dict,
+    "set": set,
+})
+
+# Allowed top-level modules by name (if present in namespace)
+ALLOWED_MODULE_NAMES = {"math", "numpy", "np"}
+
+# Allowed attributes callable on math/numpy modules
+# Keep conservative; extend if you need more.
+MATH_ATTRS = {
+    "pi", "e", "tau",
+    "sin", "cos", "tan",
+    "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh",
+    "asinh", "acosh", "atanh",
+    "exp", "log", "log10", "log2",
+    "sqrt", "pow", "floor", "ceil", "fabs",
+    "degrees", "radians",
+}
+NUMPY_ATTRS_CONST = {
+    # constants & dtypes commonly used in GRC
+    "pi", "e",
+    "float16", "float32", "float64",
+    "int8", "int16", "int32", "int64",
+    "uint8", "uint16", "uint32", "uint64",
+    "complex64", "complex128",
+}
+NUMPY_ATTRS_FUNCS = {
+    # basic numerics that are typically safe
+    "sin", "cos", "tan", "arcsin", "arccos", "arctan", "arctan2",
+    "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh",
+    "exp", "log", "log10", "log2", "sqrt", "power",
+    "floor", "ceil", "abs", "maximum", "minimum",
+    "deg2rad", "rad2deg",
+    # array constructors common in parameters (optional; comment out if you want stricter)
+    "array", "arange", "linspace",
+}
+NUMPY_ATTRS = NUMPY_ATTRS_CONST | NUMPY_ATTRS_FUNCS
+
+# For calls by bare name (not module.attr), allow only these builtins
+ALLOWED_BARE_CALLS = {"abs", "min", "max", "round", "int", "float", "complex", "bool", "len"}
+
+# Nodes we allow in expressions
+_ALLOWED_NODE_TYPES = (
+    ast.Expression,
+    ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.IfExp,
+    ast.Constant,
+    ast.Name,
+    ast.Attribute,
+    ast.Subscript, ast.Slice, ast.ExtSlice, ast.Index,  # Index is py<3.9; harmless in 3.11 AST but safe to list
+    ast.Tuple, ast.List, ast.Dict, ast.Set,
+    ast.Load,
+    ast.Call,
+)
+
+# Allowed operators
+_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.MatMult)
+_ALLOWED_UNARYOPS = (ast.UAdd, ast.USub, ast.Not, ast.Invert)
+_ALLOWED_CMPOPS = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot, ast.In, ast.NotIn)
+_ALLOWED_BOOLOPS = (ast.And, ast.Or)
+
+# Allowlist of module prefixes that GRC commonly needs. Extend as necessary.
+ALLOWED_IMPORT_PREFIXES = {
+    "math",
+    "numpy",
+    "gnuradio",
+    "gnuradio.gr",
+    "pmt",
+}
+
+def _attr_chain(node: ast.AST) -> list[str]:
+    """
+    Return ['root', 'attr1'] for 'root.attr1', or longer lists for deeper chains.
+    If not a simple attribute chain, return [].
+    """
+    parts: list[str] = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        return list(reversed(parts))
+    return []  # Not a simple Name.attr[.attr...] chain
+
+class _SafeExprValidator(ast.NodeVisitor):
+    def visit(self, node):  # type: ignore[override]
+        if not isinstance(node, _ALLOWED_NODE_TYPES):
+            raise UnsafeExpressionError(f"Unsupported expression node: {type(node).__name__}")
+        return super().visit(node)
+
+    def visit_Call(self, node: ast.Call):
+        # Only allow calls to:
+        #  - whitelisted builtins by bare name (e.g., abs(x))
+        #  - whitelisted math/numpy functions by module attribute (e.g., math.sin(x), np.sqrt(x))
+        func = node.func
+
+        if isinstance(func, ast.Name):
+            if func.id not in ALLOWED_BARE_CALLS:
+                raise UnsafeExpressionError(f"Calling '{func.id}' is not allowed.")
+        elif isinstance(func, ast.Attribute):
+            chain = _attr_chain(func)
+            if len(chain) != 2:
+                # Disallow deep attribute calls like np.random.rand()
+                raise UnsafeExpressionError("Deep attribute calls are not allowed.")
+            root, attr = chain
+            if root not in ALLOWED_MODULE_NAMES:
+                raise UnsafeExpressionError(f"Calls on '{root}' are not allowed.")
+            if root in {"math"} and attr not in MATH_ATTRS:
+                raise UnsafeExpressionError(f"math.{attr} is not allowed.")
+            if root in {"numpy", "np"} and attr not in NUMPY_ATTRS:
+                raise UnsafeExpressionError(f"{root}.{attr} is not allowed.")
+        else:
+            raise UnsafeExpressionError("Only direct function names or module attributes may be called.")
+
+        # Validate arguments/keywords recursively
+        for a in node.args:
+            self.visit(a)
+        for kw in node.keywords or []:
+            self.visit(kw.value)
+
+    def visit_Attribute(self, node: ast.Attribute):
+        # Allow attribute access ONLY on allowed modules and only for whitelisted attributes.
+        chain = _attr_chain(node)
+        if not chain:
+            raise UnsafeExpressionError("Attribute access on non-module objects is not allowed.")
+        if len(chain) != 2:
+            raise UnsafeExpressionError("Deep attribute chains are not allowed.")
+        root, attr = chain
+        if root == "math" and attr not in MATH_ATTRS:
+            raise UnsafeExpressionError(f"math.{attr} is not allowed.")
+        if root in {"numpy", "np"} and attr not in NUMPY_ATTRS:
+            raise UnsafeExpressionError(f"{root}.{attr} is not allowed.")
+
+    def visit_Subscript(self, node: ast.Subscript):
+        # Indexing/slicing is allowed as long as inner nodes are safe
+        self.visit(node.value)
+        self.visit(node.slice)
+
+    def visit_Slice(self, node: ast.Slice):
+        if node.lower: self.visit(node.lower)
+        if node.upper: self.visit(node.upper)
+        if node.step:  self.visit(node.step)
+
+    def visit_BoolOp(self, node: ast.BoolOp):
+        if not isinstance(node.op, _ALLOWED_BOOLOPS):
+            raise UnsafeExpressionError("Boolean operator not allowed.")
+        for v in node.values:
+            self.visit(v)
+
+    def visit_BinOp(self, node: ast.BinOp):
+        if not isinstance(node.op, _ALLOWED_BINOPS):
+            raise UnsafeExpressionError("Binary operator not allowed.")
+        self.visit(node.left)
+        self.visit(node.right)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp):
+        if not isinstance(node.op, _ALLOWED_UNARYOPS):
+            raise UnsafeExpressionError("Unary operator not allowed.")
+        self.visit(node.operand)
+
+    def visit_Compare(self, node: ast.Compare):
+        for op in node.ops:
+            if not isinstance(op, _ALLOWED_CMPOPS):
+                raise UnsafeExpressionError("Comparison operator not allowed.")
+        self.visit(node.left)
+        for c in node.comparators:
+            self.visit(c)
+
+    def visit_IfExp(self, node: ast.IfExp):
+        self.visit(node.test)
+        self.visit(node.body)
+        self.visit(node.orelse)
+
+    # Literals & containers are inherently safe (already whitelisted in _ALLOWED_NODE_TYPES)
+    # We still walk elements to enforce safety of nested expressions.
+    def visit_Tuple(self, node: ast.Tuple):
+        for el in node.elts: self.visit(el)
+
+    def visit_List(self, node: ast.List):
+        for el in node.elts: self.visit(el)
+
+    def visit_Set(self, node: ast.Set):
+        for el in node.elts: self.visit(el)
+
+    def visit_Dict(self, node: ast.Dict):
+        for k in node.keys: 
+            if k is not None: self.visit(k)
+        for v in node.values: self.visit(v)
+
+    def visit_Name(self, node: ast.Name):
+        # Bare names are OK, they resolve in filtered globals/locals later.
+        # We specifically do NOT allow access to __builtins__ by not injecting it in globals.
+        return
+
+    def visit_Constant(self, node: ast.Constant):
+        # Allow numbers, strings, bytes, bools, None
+        return
+
+def _filter_globals_for_eval(namespace: dict) -> dict:
+    """
+    Build a safe globals dict for eval: restricted builtins and filtered modules.
+    We copy over all user variables (ints, floats, lists, dicts, etc.) and any
+    allowed modules (math, numpy/np) if present.
+    """
+    g = {"__builtins__": SAFE_BUILTINS}
+
+    # expose math (always safe subset)
+    g["math"] = _math
+
+    # expose numpy aliases if in the incoming namespace or importable
+    if "numpy" in namespace and namespace["numpy"] is not None:
+        g["numpy"] = namespace["numpy"]
+    elif _np is not None:
+        g["numpy"] = _np
+
+    if "np" in namespace and namespace["np"] is not None:
+        g["np"] = namespace["np"]
+    elif _np is not None:
+        g["np"] = _np
+
+    # Copy non-module variables through verbatim.
+    for k, v in namespace.items():
+        # Skip shadowing of protected names
+        if k in {"__builtins__", "__import__"}:
+            continue
+        # Do not expose disallowed modules (if any slipped into namespace)
+        modname = getattr(v, "__name__", None)
+        if modname and getattr(v, "__spec__", None) is not None:
+            # it's a module-like object
+            if k not in ALLOWED_MODULE_NAMES:
+                continue  # skip disallowed modules
+        g[k] = v
+
+    return g
+
+def safe_eval(expr: str, globals_ns: dict, locals_ns: Optional[dict] = None):
+    """
+    Validate 'expr' AST, then eval it with restricted builtins and filtered globals.
+    Raises UnsafeExpressionError for unsafe constructs.
+    """
+    if not expr or not isinstance(expr, str):
+        raise UnsafeExpressionError("Empty or invalid expression.")
+
+    # Quick path: simple literal
+    try:
+        # ast.literal_eval is safe but handles only literals/containers
+        return ast.literal_eval(expr)
+    except Exception:
+        pass
+
+    # Parse and validate
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        # keep original error surface for callers
+        raise e
+
+    _SafeExprValidator().visit(tree)
+
+    # Evaluate with restricted globals
+    safe_globals = _filter_globals_for_eval(globals_ns or {})
+    safe_locals = {} if locals_ns is None else dict(locals_ns)  # shallow copy
+
+    # Ensure locals cannot reintroduce builtins
+    safe_locals.pop("__builtins__", None)
+
+    return eval(compile(tree, filename="<safe-expr>", mode="eval"), safe_globals, safe_locals)
 
 class FlowGraph(Element):
 
@@ -232,11 +528,12 @@ class FlowGraph(Element):
         """
         for expr in self.imports():
             try:
-                exec(expr, namespace)
+                _apply_validated_imports(expr, namespace)
             except ImportError:
-                # We do not have a good way right now to determine if an import is for a
-                # hier block, these imports will fail as they are not in the search path
-                # this is ok behavior, unfortunately we could be hiding other import bugs
+                # Hier block imports may fail (search path), keep current behavior
+                pass
+            except (ImportSecurityError, SyntaxError):
+                log.exception(f"Failed to evaluate import expression \"{expr}\"", exc_info=True)
                 pass
             except Exception:
                 log.exception(f"Failed to evaluate import expression \"{expr}\"", exc_info=True)
@@ -246,8 +543,7 @@ class FlowGraph(Element):
     def _reload_modules(self, namespace: dict) -> dict:
         for id, expr in self.get_python_modules():
             try:
-                module = types.ModuleType(id)
-                exec(expr, module.__dict__)
+                module = _exec_module_safely(expr, id)
                 namespace[id] = module
             except Exception:
                 log.exception(f'Failed to evaluate expression in module {id}', exc_info=True)
@@ -261,11 +557,15 @@ class FlowGraph(Element):
         np = {}  # params don't know each other
         for parameter_block in self.get_parameters():
             try:
-                value = eval(
-                    parameter_block.params['value'].to_code(), namespace)
+                code = parameter_block.params['value'].to_code()
+                value = safe_eval(code, namespace)
                 np[parameter_block.name] = value
             except Exception:
-                log.exception(f'Failed to evaluate parameter block {parameter_block.name}', exc_info=True)
+                # Keep original logging behavior
+                log.exception(
+                    f'Failed to evaluate parameter block {parameter_block.name}',
+                    exc_info=True
+                )
                 pass
         namespace.update(np)  # Merge param namespace
         return namespace
@@ -277,8 +577,7 @@ class FlowGraph(Element):
         for variable_block in self.get_variables():
             try:
                 variable_block.rewrite()
-                value = eval(variable_block.value, namespace,
-                             variable_block.namespace)
+                value = safe_eval(variable_block.value, namespace, variable_block.namespace)
                 namespace[variable_block.name] = value
                 # rewrite on subsequent blocks depends on an updated self.namespace
                 self.namespace.update(namespace)
@@ -286,7 +585,10 @@ class FlowGraph(Element):
             except (TypeError, FileNotFoundError, AttributeError, yaml.YAMLError):
                 pass
             except Exception:
-                log.exception(f'Failed to evaluate variable block {variable_block.name}', exc_info=True)
+                log.exception(
+                    f'Failed to evaluate variable block {variable_block.name}',
+                    exc_info=True
+                )
         return namespace
 
     def _renew_namespace(self) -> None:
@@ -310,13 +612,28 @@ class FlowGraph(Element):
         """
         Evaluate the expression within the specified global and local namespaces
         """
+
         # Evaluate
         if not expr:
             raise Exception('Cannot evaluate empty statement.')
+    
+    
         if namespace is not None:
-            return eval(expr, namespace, local_namespace)
+            return safe_eval(expr, namespace, local_namespace)
+            return safe_eval(expr, namespace, local_namespace)
         else:
-            return self._eval_cache.setdefault(expr, eval(expr, self.namespace, local_namespace))
+            # cache only successful results
+            if expr in self._eval_cache:
+                return self._eval_cache[expr]
+            value = safe_eval(expr, self.namespace, local_namespace)
+            self._eval_cache[expr] = value
+            return value
+            # cache only successful results
+            if expr in self._eval_cache:
+                return self._eval_cache[expr]
+            value = safe_eval(expr, self.namespace, local_namespace)
+            self._eval_cache[expr] = value
+            return value
 
     ##############################################
     # Add/remove stuff
