@@ -528,12 +528,11 @@ class FlowGraph(Element):
         """
         for expr in self.imports():
             try:
-                _apply_validated_imports(expr, namespace)
+                exec(expr, namespace)
             except ImportError:
-                # Hier block imports may fail (search path), keep current behavior
-                pass
-            except (ImportSecurityError, SyntaxError):
-                log.exception(f"Failed to evaluate import expression \"{expr}\"", exc_info=True)
+                # We do not have a good way right now to determine if an import is for a
+                # hier block, these imports will fail as they are not in the search path
+                # this is ok behavior, unfortunately we could be hiding other import bugs
                 pass
             except Exception:
                 log.exception(f"Failed to evaluate import expression \"{expr}\"", exc_info=True)
@@ -543,7 +542,8 @@ class FlowGraph(Element):
     def _reload_modules(self, namespace: dict) -> dict:
         for id, expr in self.get_python_modules():
             try:
-                module = _exec_module_safely(expr, id)
+                module = types.ModuleType(id)
+                exec(expr, module.__dict__)
                 namespace[id] = module
             except Exception:
                 log.exception(f'Failed to evaluate expression in module {id}', exc_info=True)
@@ -557,15 +557,11 @@ class FlowGraph(Element):
         np = {}  # params don't know each other
         for parameter_block in self.get_parameters():
             try:
-                code = parameter_block.params['value'].to_code()
-                value = safe_eval(code, namespace)
+                value = eval(
+                    parameter_block.params['value'].to_code(), namespace)
                 np[parameter_block.name] = value
             except Exception:
-                # Keep original logging behavior
-                log.exception(
-                    f'Failed to evaluate parameter block {parameter_block.name}',
-                    exc_info=True
-                )
+                log.exception(f'Failed to evaluate parameter block {parameter_block.name}', exc_info=True)
                 pass
         namespace.update(np)  # Merge param namespace
         return namespace
@@ -577,7 +573,8 @@ class FlowGraph(Element):
         for variable_block in self.get_variables():
             try:
                 variable_block.rewrite()
-                value = safe_eval(variable_block.value, namespace, variable_block.namespace)
+                value = eval(variable_block.value, namespace,
+                             variable_block.namespace)
                 namespace[variable_block.name] = value
                 # rewrite on subsequent blocks depends on an updated self.namespace
                 self.namespace.update(namespace)
@@ -585,10 +582,7 @@ class FlowGraph(Element):
             except (TypeError, FileNotFoundError, AttributeError, yaml.YAMLError):
                 pass
             except Exception:
-                log.exception(
-                    f'Failed to evaluate variable block {variable_block.name}',
-                    exc_info=True
-                )
+                log.exception(f'Failed to evaluate variable block {variable_block.name}', exc_info=True)
         return namespace
 
     def _renew_namespace(self) -> None:
@@ -616,18 +610,9 @@ class FlowGraph(Element):
         # Evaluate
         if not expr:
             raise Exception('Cannot evaluate empty statement.')
-    
-    
         if namespace is not None:
             return safe_eval(expr, namespace, local_namespace)
-            return safe_eval(expr, namespace, local_namespace)
         else:
-            # cache only successful results
-            if expr in self._eval_cache:
-                return self._eval_cache[expr]
-            value = safe_eval(expr, self.namespace, local_namespace)
-            self._eval_cache[expr] = value
-            return value
             # cache only successful results
             if expr in self._eval_cache:
                 return self._eval_cache[expr]
