@@ -10,6 +10,7 @@ import shlex
 import sys
 import tempfile
 import textwrap
+import ast
 from pathlib import Path
 from shutil import which as find_executable
 
@@ -707,50 +708,57 @@ class CppGeneratorBase(CoreGeneratorBase):
                 blocks_make.append(('', make, declarations))
         return blocks_make
 
+    def infer_type_from_ast(expr):
+        try:
+            tree = ast.parse(expr, mode='eval')
+            node = tree.body
+    
+            if isinstance(node, ast.Constant):
+                return type(node.value)
+            elif isinstance(node, ast.BinOp):
+                # Assume numeric types for binary operations
+                return float
+            elif isinstance(node, ast.List):
+                # Infer type from first element if possible
+                if node.elts:
+                    first_type = infer_type_from_ast(ast.unparse(node.elts[0]))
+                    return list
+                return list
+            elif isinstance(node, ast.Name):
+                # Could be a reference to another variable
+                return None
+            elif isinstance(node, ast.Call):
+                # Block function calls entirely
+                raise ValueError("Function calls are not allowed.")
+            else:
+                return None
+        except Exception as e:
+            print(f"Failed to infer type from AST: {e}")
+            return type(None)
+    
     def _variable_types(self):
         fg = self._flow_graph
         variables = fg.get_cpp_variables()
-
-        type_translation = {'real': 'double', 'float': 'float', 'int': 'int', 'bool': 'bool',
-                            'complex_vector': 'std::vector<gr_complex>', 'real_vector': 'std::vector<double>',
-                            'float_vector': 'std::vector<float>', 'int_vector': 'std::vector<int>',
-                            'string': 'std::string', 'complex': 'gr_complex'}
-        # If the type is explicitly specified, translate to the corresponding C++ type
-        for var in list(variables):
-            if var.params['value'].dtype != 'raw':
-                var.vtype = type_translation[var.params['value'].dtype]
-                variables.remove(var)
-
-        # If the type is 'raw', we'll need to evaluate the variable to infer the type.
-        # Create an executable fragment of code containing all 'raw' variables in
-        # order to infer the lvalue types.
-        #
-        # Note that this differs from using ast.literal_eval() as literal_eval evaluates one
-        # variable at a time. The code fragment below evaluates all variables together which
-        # allows the variables to reference each other (i.e. a = b * c).
-        prog = 'def get_decl_types():\n'
-        prog += '\tvar_types = {}\n'
+    
+        type_translation = {
+            'real': 'double', 'float': 'float', 'int': 'int', 'bool': 'bool',
+            'complex_vector': 'std::vector<gr_complex>', 'real_vector': 'std::vector<double>',
+            'float_vector': 'std::vector<float>', 'int_vector': 'std::vector<int>',
+            'string': 'std::string', 'complex': 'gr_complex'
+        }
+    
+        raw_vars = []
         for var in variables:
-            prog += '\t' + str(var.params['id'].value) + \
-                '=' + str(var.params['value'].value) + '\n'
-        prog += '\tvar_types = {}\n'
-        for var in variables:
-            prog += '\tvar_types[\'' + str(var.params['id'].value) + \
-                '\'] = type(' + str(var.params['id'].value) + ')\n'
-        prog += '\treturn var_types'
-
-        # Execute the code fragment in a separate namespace and retrieve the lvalue types
-        var_types = {}
-        namespace = {}
-        try:
-            exec(prog, namespace)
-            var_types = namespace['get_decl_types']()
-        except Exception as excp:
-            print('Failed to get parameter lvalue types: %s' % (excp))
-
-        # Format the rvalue of each variable expression
-        for var in variables:
-            var.format_expr(var_types[str(var.params['id'].value)])
+            dtype = var.params['value'].dtype
+            if dtype != 'raw':
+                var.vtype = type_translation.get(dtype, 'unknown')
+            else:
+                raw_vars.append(var)
+    
+        for var in raw_vars:
+            expr = var.params['value'].value
+            inferred_type = infer_type_from_ast(expr)
+            var.format_expr(inferred_type)
 
     def _parameter_types(self):
         fg = self._flow_graph
