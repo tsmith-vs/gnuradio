@@ -529,12 +529,7 @@ class FlowGraph(Element):
         for expr in self.imports():
             try:
                 _apply_validated_imports(expr, namespace)
-                _apply_validated_imports(expr, namespace)
             except ImportError:
-                # Hier block imports may fail (search path), keep current behavior
-                pass
-            except (ImportSecurityError, SyntaxError):
-                log.exception(f"Failed to evaluate import expression \"{expr}\"", exc_info=True)
                 # Hier block imports may fail (search path), keep current behavior
                 pass
             except (ImportSecurityError, SyntaxError):
@@ -548,7 +543,6 @@ class FlowGraph(Element):
     def _reload_modules(self, namespace: dict) -> dict:
         for id, expr in self.get_python_modules():
             try:
-                module = _exec_module_safely(expr, id)
                 module = _exec_module_safely(expr, id)
                 namespace[id] = module
             except Exception:
@@ -565,15 +559,8 @@ class FlowGraph(Element):
             try:
                 code = parameter_block.params['value'].to_code()
                 value = safe_eval(code, namespace)
-                code = parameter_block.params['value'].to_code()
-                value = safe_eval(code, namespace)
                 np[parameter_block.name] = value
             except Exception:
-                # Keep original logging behavior
-                log.exception(
-                    f'Failed to evaluate parameter block {parameter_block.name}',
-                    exc_info=True
-                )
                 # Keep original logging behavior
                 log.exception(
                     f'Failed to evaluate parameter block {parameter_block.name}',
@@ -591,7 +578,6 @@ class FlowGraph(Element):
             try:
                 variable_block.rewrite()
                 value = safe_eval(variable_block.value, namespace, variable_block.namespace)
-                value = safe_eval(variable_block.value, namespace, variable_block.namespace)
                 namespace[variable_block.name] = value
                 # rewrite on subsequent blocks depends on an updated self.namespace
                 self.namespace.update(namespace)
@@ -599,10 +585,6 @@ class FlowGraph(Element):
             except (TypeError, FileNotFoundError, AttributeError, yaml.YAMLError):
                 pass
             except Exception:
-                log.exception(
-                    f'Failed to evaluate variable block {variable_block.name}',
-                    exc_info=True
-                )
                 log.exception(
                     f'Failed to evaluate variable block {variable_block.name}',
                     exc_info=True
